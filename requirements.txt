@@ -1,0 +1,7 @@
+numpy
+opencv-python
+pyyaml
+rosbags
+rosbag2-py
+scipy
+# System dependencies: ROS2 (rclpy), Docker
