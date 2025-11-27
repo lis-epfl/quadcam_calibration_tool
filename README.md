@@ -22,8 +22,6 @@ Install the required Python packages:
 pip install -r requirements.txt
 ```
 
-Requires: `scipy`, `numpy`, `opencv-python`, `pyyaml`, `rosbags`, `rosbag2-py`.
-
 ### 2. System Dependencies
 
 **ROS 2 (Humble recommended)**
