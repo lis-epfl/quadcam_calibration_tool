@@ -73,7 +73,7 @@ oak_ffc_4p_driver_node:
 Run `calibrate_physical.py` to record a calibration sequence and solve for the physical parameters of the rig:
 
 ```bash
-python3 calibrate_physical.py --out calibration_output
+python3 calibrate_physical.py 
 ```
 
 ### Interactive Recording
@@ -81,16 +81,6 @@ python3 calibrate_physical.py --out calibration_output
 A window will open showing the camera feed (4-image grid).
 
 **Press `SPACE`** to advance through stages:
-
-**Mono recordings:**
-- 0, 1, 2, 3 (cover full FOV of each camera)
-
-**Pair recordings:**
-- 0–1
-- 1–2
-- 2–3
-- 3–0
-(move checkerboard inside overlap regions)
 
 The order or recording goes like this for easy setup: mono0, pair01, mono1, pair12, mono2, pair23, mono3, pair30.
 
