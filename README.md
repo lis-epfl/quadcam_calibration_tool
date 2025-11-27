@@ -94,7 +94,7 @@ The script will automatically launch Docker to run the solver.
 - `--out` – Output directory (default: `calibration_output`)
 - `--topic` – ROS 2 image topic (default: `/oak_ffc_4p_driver_node/compressed`)
 - `--uncompressed` – Use if topic publishes raw `sensor_msgs/Image`
-- `--only` – Calibrate specific targets only (e.g., `--only mono0`)
+- `--only` – Calibrate specific targets only (e.g., `--only mono0,pair01`)
 - `--skip-recording` – Re-calibrate using existing bags only
 
 ---
