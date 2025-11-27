@@ -1,4 +1,4 @@
-# Quad-Cam Calibration Toolbox
+# Quadcam Calibration Toolbox
 
 A minimal, automated toolkit to calibrate a 4-camera fisheye system (e.g., **OAK-FFC-4P**) and generate rectification maps for stereo depth estimation of the OmniNxt system. This repo was inspired by this [repo](https://github.com/UAV-Swarm/tools-quarterKalibr).
 
