@@ -87,6 +87,8 @@ The script will automatically launch Docker to run the solver.
 
 ![Calibration Visualization](imgs/calibration.gif)
 
+After the calibration is done, check the pdf files in `calibration_output/cam_*` and make sure the reprojection error is less then 1.5 pixels. If not, you can recalibrate the camera/pair in question using the `--only` argument (see arguments below).
+
 ### Arguments
 
 - `--out` – Output directory (default: `calibration_output`)
