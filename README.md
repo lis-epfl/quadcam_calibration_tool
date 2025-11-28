@@ -104,7 +104,7 @@ After the calibration is done, check the pdf files in `calibration_output/cam_*`
 Run the map generation script:
 
 ```bash
-python3 generate_maps.py --width 320 --height 240 --hfov 100
+python3 generate_maps.py --width 224 --height 224 --hfov 110
 ```
 
 ### Visual Verification
@@ -125,8 +125,8 @@ Press any key to continue to the next pair.
 
 - `--calib-dir` – Input calibration folder (default: `calibration_output`)
 - `--out-dir` – Output directory for final maps (default: `final_maps`)
-- `--width, --height` – Final rectified resolution (default: 320×240)
-- `--hfov` – Horizontal FoV for virtual stereo (default: 100°)
+- `--width, --height` – Final rectified resolution (default: 224x224)
+- `--hfov` – Horizontal FoV for virtual stereo (default: 110°)
 
 ---
 
