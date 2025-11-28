@@ -150,7 +150,7 @@ final_maps/
 to your depth estimation package’s config directory, e.g.:
 
 ```
-depth_estimation_ros2/config/final_maps_240_320
+depth_estimation_ros2/config/final_maps_224_224
 ```
 
 ## TODO
