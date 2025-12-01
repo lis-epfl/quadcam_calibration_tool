@@ -38,30 +38,10 @@ Required for running the TartanCalib calibration solver.
 
 ## Step 0: Start Camera Driver
 
-Before starting the calibration scripts, launch the camera driver [`oak_ffc_4p_driver`](https://github.com/lis-epfl/oak_ffc_4p_driver_ros2) to publish the required image topics. Make sure that your drone and your PC where you're doing the calibration have the same `ROS_DOMAIN_ID` to be able to subscribe to the image topic.
+Before starting the calibration scripts, launch the camera driver [`oak_ffc_4p_driver`](https://github.com/lis-epfl/oak_ffc_4p_driver_ros2) to publish the required image topics. Make sure that your drone and your PC where you're doing the calibration have the same `ROS_DOMAIN_ID` to be able to subscribe to the image topic. You need to launch:
 
-**Crucial:** Ensure your driver configuration (`cam_config.yaml` or equivalent parameters) matches the settings below.
-`synс_master` must be set, and `compress_images: true` should be enabled for efficient recording.
-
-```yaml
-oak_ffc_4p_driver_node:
-  ros__parameters:
-    sync_master: "CAM_A"              # master clock: "CAM_A", "CAM_B", "CAM_C", "CAM_D"
-    resolution: "800"
-    fps: 10
-    rgb: true
-    auto_exposure_time: true
-    exposure_time_us: 10000
-    iso: 400
-    image_info: true
-    auto_awb: true
-    awb_value: 4000
-    sharpness_calibration_mode: false
-    enable_upside_down: false
-    max_size_fps: 10
-    publish_cams_individually: false
-    compress_images: true
-    jpeg_quality: 90
+```bash
+ros2 launch oak_ffc_4p_driver_ros2 oak_ffc_4p_driver_calibration.launch
 ```
 
 ---
