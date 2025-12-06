@@ -474,10 +474,29 @@ class MultiCamCalibrator:
                 elif key == ord(' '): idx += 1
 
         finally:
+            print("  [Info] Waiting for buffer to drain...")
+            # 1. STOP the writer thread first.
+            # This waits (joins) until the queue is empty and the thread finishes.
             buf_writer.stop()
+
+            # 2. NOW it is safe to close the files to save metadata.
+            # The background thread is dead, so no more writes will happen.
+            all_writers = list(mono_writers.values()) + list(pair_writers.values())
+            for bundle in all_writers:
+                if hasattr(bundle.writer, 'close'):
+                    bundle.writer.close()
+                else:
+                    # Fallback for older ROS 2 bindings
+                    del bundle.writer
+
+            # 3. Final Cleanup
+            mono_writers.clear()
+            pair_writers.clear()
+
             cv2.destroyAllWindows()
             executor.shutdown()
             subscriber.destroy_node()
+            print("  [Info] Recording cleanup complete.")
 
     def convert_all_to_ros1(self, recording_target: RecordingTarget, force_reconvert: bool = True):
         print("\n[Step 2] Converting ROS2 -> ROS1...")
