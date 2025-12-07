@@ -156,6 +156,8 @@ class BufferedRosBagWriter:
         self.stop_event = threading.Event()
         self.dropped_frames = 0
         self.written_frames = 0
+        self.queued_frames = 0
+        self._lock = threading.Lock()
 
     def start(self):
         self.stop_event.clear()
@@ -163,35 +165,73 @@ class BufferedRosBagWriter:
         self.writer_thread.start()
 
     def stop(self):
+        """Signal stop and wait for all queued frames to be written."""
         self.stop_event.set()
-        if self.writer_thread: self.writer_thread.join(timeout=10)
+        # Put a sentinel to ensure the thread wakes up if waiting on get()
+        try:
+            self.write_queue.put_nowait(None)
+        except queue.Full:
+            pass
+        if self.writer_thread:
+            self.writer_thread.join(timeout=60)  # Generous timeout for large buffers
 
     def queue_frame(self, frame_data: FrameData, writers: dict, recording_type: str, recording_data):
         try:
             self.write_queue.put_nowait((frame_data, writers, recording_type, recording_data))
+            with self._lock:
+                self.queued_frames += 1
         except queue.Full:
             self.dropped_frames += 1
 
+    def get_pending_count(self) -> int:
+        """Returns approximate number of frames still pending write."""
+        with self._lock:
+            return self.queued_frames - self.written_frames
+
     def _writer_loop(self):
-        while not self.stop_event.is_set() or not self.write_queue.empty():
+        while True:
             try:
-                item = self.write_queue.get(timeout=0.1)
-                if item is None: continue
+                # Use longer timeout to avoid busy-waiting
+                item = self.write_queue.get(timeout=0.5)
+
+                # Sentinel value signals shutdown after queue is drained
+                if item is None:
+                    # Check if there are more real items behind the sentinel
+                    if self.write_queue.empty():
+                        break
+                    else:
+                        continue
+
                 frame_data, writers, recording_type, recording_data = item
 
                 if recording_type == 'MONO':
                     ci = recording_data
+                    if ci not in writers:
+                        print(f"\n[WARN] Writer for cam {ci} not found, skipping frame")
+                        continue
                     img_msg = _ros_image_from_numpy(frame_data.frames_cv[ci], frame_data.stamp)
                     writers[ci].writer.write(f"/cam_{ci}/image_raw", _serialize(img_msg), frame_data.timestamp_ns)
                 elif recording_type == 'PAIR':
                     i, j = recording_data
+                    if (i, j) not in writers:
+                        print(f"\n[WARN] Writer for pair ({i}, {j}) not found, skipping frame")
+                        continue
                     img_i = _ros_image_from_numpy(frame_data.frames_cv[i], frame_data.stamp)
                     img_j = _ros_image_from_numpy(frame_data.frames_cv[j], frame_data.stamp)
                     writers[(i, j)].writer.write(f"/cam_{i}/image_raw", _serialize(img_i), frame_data.timestamp_ns)
                     writers[(i, j)].writer.write(f"/cam_{j}/image_raw", _serialize(img_j), frame_data.timestamp_ns)
-                self.written_frames += 1
-            except queue.Empty: continue
-            except Exception as e: print(f"\n[ERROR] Writer exception: {e}")
+
+                with self._lock:
+                    self.written_frames += 1
+
+            except queue.Empty:
+                # If stop was requested and queue is empty, exit
+                if self.stop_event.is_set():
+                    break
+            except Exception as e:
+                import traceback
+                print(f"\n[ERROR] Writer exception: {e}")
+                traceback.print_exc()
 
 
 class StackedImageSubscriber(Node):
@@ -430,15 +470,34 @@ class MultiCamCalibrator:
         # START IDLE at -1
         idx = -1
         done = False
+        draining = False  # New state for buffer draining
 
         print("[Visualization] Press 'SPACE' to advance recording stage, 'q' to quit.")
+
+        last_frame_data = None  # Keep last frame for display during draining
 
         try:
             while not done:
                 frame_data = subscriber.get_new_frame()
                 recording_cams = []
 
-                # Logic for current stage
+                if draining:
+                    # We're draining the buffer - don't record new frames
+                    pending = buf_writer.get_pending_count()
+                    if pending <= 0:
+                        done = True
+                        status = "Buffer drained. Exiting..."
+                    else:
+                        status = f"DRAINING BUFFER: {pending} frames remaining..."
+                    # Use last frame for display
+                    if last_frame_data:
+                        buffer_usage = f"Pending: {pending}"
+                        viz = _create_viz_grid(last_frame_data[0], n_kept_mono, n_kept_pair, status, [], buffer_usage)
+                        cv2.imshow("Live Calibration Recording", viz)
+                    key = cv2.waitKey(50) & 0xFF
+                    continue
+
+                # Normal recording logic
                 if idx == -1:
                     status = "IDLE: Press SPACE to start recording."
                 elif 0 <= idx < len(stages):
@@ -461,8 +520,12 @@ class MultiCamCalibrator:
                     status = "DONE. Press 'q' to exit."
 
                 if frame_data:
+                    last_frame_data = frame_data  # Store for draining display
                     # Update buffer usage text
+                    pending = buf_writer.get_pending_count()
                     buffer_usage = f"Buffer: {buf_writer.write_queue.qsize()}/{buf_writer.buffer_size}"
+                    if pending > 0:
+                        buffer_usage += f" | Pending: {pending}"
                     if buf_writer.dropped_frames > 0:
                         buffer_usage += f" | Dropped: {buf_writer.dropped_frames}"
 
@@ -470,7 +533,14 @@ class MultiCamCalibrator:
                     cv2.imshow("Live Calibration Recording", viz)
 
                 key = cv2.waitKey(10) & 0xFF
-                if key == ord('q'): done = True
+                if key == ord('q'):
+                    # Don't exit immediately - start draining
+                    pending = buf_writer.get_pending_count()
+                    if pending > 0:
+                        print(f"  [Info] Draining {pending} frames from buffer...")
+                        draining = True
+                    else:
+                        done = True
                 elif key == ord(' '): idx += 1
 
         finally:
