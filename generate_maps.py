@@ -302,8 +302,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--calib-dir", default="calibration_output")
     parser.add_argument("--out-dir", default="final_maps")
-    parser.add_argument("--width", type=int, default=224)
-    parser.add_argument("--height", type=int, default=224)
+    parser.add_argument("--width", type=int, default=256)
+    parser.add_argument("--height", type=int, default=160)
     parser.add_argument("--hfov", type=float, default=110.0)
     args = parser.parse_args()
 

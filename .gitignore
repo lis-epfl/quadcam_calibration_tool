@@ -1,6 +1,6 @@
 # ignore output
-calibration_output/
-final_maps/
+calibration_output*
+final_maps*
 
 # ignore virtual environment
 .venv/

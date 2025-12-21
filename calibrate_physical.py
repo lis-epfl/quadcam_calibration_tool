@@ -149,7 +149,7 @@ class FrameData:
 
 
 class BufferedRosBagWriter:
-    def __init__(self, buffer_size: int = 200):
+    def __init__(self, buffer_size: int = 300):
         self.buffer_size = buffer_size
         self.write_queue = queue.Queue(maxsize=buffer_size)
         self.writer_thread = None
