@@ -23,6 +23,45 @@ except ImportError:
     pass
 
 # ==========================================
+# CONFIGURATION FLAGS
+# ==========================================
+
+# Intrinsics source:
+#   True  = Load from pair calibration (cam_X_Y/log1-camchain.yaml)
+#   False = Load from mono calibration (cam_X/log1-camchain.yaml)
+USE_PAIR_INTRINSICS = True
+
+# Extrinsics source:
+#   True  = Use hardcoded averaged extrinsic for all pairs
+#   False = Load from pair calibration (cam_X_Y/log1-camchain.yaml)
+USE_HARDCODED_EXTRINSICS = False
+
+# ==========================================
+# HARDCODED EXTRINSICS (Optional Override)
+# ==========================================
+# T_cn_cnm1 transforms points from cam_i to cam_j (left to right in pair)
+# Example: For pair (0,1), this is T_cam1_cam0
+
+# Averaged extrinsic from calibration files: cam_0_1, cam_1_2, cam_2_3, cam_3_0
+# Rotation: averaged via quaternion mean
+# Translation: arithmetic mean
+
+_HARDCODED_EXTRINSIC_AVG = np.array([
+    [-0.0032014063790135, 0.0220171842014113, -0.9997524666621423, -0.1078558768335056],
+    [-0.0000210399463344, 0.9997575882301164, 0.0220173643659319, 0.0019693287951015],
+    [0.9999948752641273, 0.0000915212689764, -0.0032001670800529, -0.1038849286988905],
+    [0.0000000000000000, 0.0000000000000000, 0.0000000000000000, 1.0000000000000000],
+])
+
+# Apply the same averaged extrinsic to all pairs when USE_HARDCODED_EXTRINSICS is True
+HARDCODED_EXTRINSICS = {
+    (0, 1): _HARDCODED_EXTRINSIC_AVG,
+    (1, 2): _HARDCODED_EXTRINSIC_AVG,
+    (2, 3): _HARDCODED_EXTRINSIC_AVG,
+    (3, 0): _HARDCODED_EXTRINSIC_AVG,
+} if USE_HARDCODED_EXTRINSICS else {}
+
+# ==========================================
 # PART 1: MATH & PROJECTIONS
 # ==========================================
 
@@ -68,91 +107,145 @@ def projectPoints_fisheye(pts3d, K, xi, D):
 
     return pts2d_final, full_mask
 
+
 class VirtualStereoGen:
     def __init__(self, calib_dir, width, height, hfov):
         self.calib_dir = Path(calib_dir)
         self.W = width
         self.H = height
         self.HFOV = hfov
+
+        # Load mono intrinsics (used if USE_PAIR_INTRINSICS is False)
+        if not USE_PAIR_INTRINSICS:
+            self.mono_intrinsics = self._load_all_mono_intrinsics()
+        else:
+            self.mono_intrinsics = {}
+
         # Store absolute poses of all physical cameras relative to Cam0
         self.cam_poses_in_cam0 = self._load_full_chain()
+
+    def _load_all_mono_intrinsics(self):
+        """Load intrinsics from mono calibration files (cam_X/log1-camchain.yaml)"""
+        intrinsics = {}
+        for cam_id in range(4):
+            mono_path = self.calib_dir / f"cam_{cam_id}" / "log1-camchain.yaml"
+            if mono_path.exists():
+                with open(mono_path) as f:
+                    data = yaml.safe_load(f)
+                intrinsics[cam_id] = self._extract_intrinsics(data['cam0'])
+                print(f"  [Mono] Loaded intrinsics for cam_{cam_id}")
+            else:
+                print(f"  [Warn] Mono calibration not found: {mono_path}")
+        return intrinsics
+
+    def _extract_intrinsics(self, cam_data):
+        """Extract intrinsic parameters from calibration data"""
+        intr = cam_data['intrinsics']
+        dist = cam_data['distortion_coeffs']
+        return {
+            'xi': intr[0],
+            'fx': intr[1],
+            'fy': intr[2],
+            'cx': intr[3],
+            'cy': intr[4],
+            'D': np.array(dist),
+            'K': np.array([[intr[1], 0, intr[3]],
+                          [0, intr[2], intr[4]],
+                          [0, 0, 1]])
+        }
+
+    def _load_extrinsics_for_pair(self, i, j):
+        """Load extrinsics from pair calibration or hardcoded values"""
+        # Check hardcoded first
+        if (i, j) in HARDCODED_EXTRINSICS:
+            print(f"  [Extr] Using HARDCODED extrinsics for pair ({i}, {j})")
+            return HARDCODED_EXTRINSICS[(i, j)]
+
+        # Load from pair calibration
+        pair_path = self.calib_dir / f"cam_{i}_{j}" / "log1-camchain.yaml"
+        if pair_path.exists():
+            with open(pair_path) as f:
+                data = yaml.safe_load(f)
+            if 'cam1' in data and 'T_cn_cnm1' in data['cam1']:
+                print(f"  [Extr] Loaded calibrated extrinsics for pair ({i}, {j})")
+                return np.array(data['cam1']['T_cn_cnm1'])
+
+        print(f"  [Warn] No extrinsics found for pair ({i}, {j})")
+        return None
 
     def _load_full_chain(self):
         """Calculates T_cam_i_to_cam0 for all 4 cameras."""
         poses = {0: np.eye(4)}
 
         # We need the chain 0->1, 1->2, 2->3.
-        # These are usually stored in the pair folders.
-        pairs_to_trace = [(0,1), (1,2), (2,3)]
+        pairs_to_trace = [(0, 1), (1, 2), (2, 3)]
 
-        current_pose = np.eye(4) # Pose of current cam in Cam0
+        current_pose = np.eye(4)  # Pose of current cam in Cam0
 
         for i, next_i in pairs_to_trace:
-            chain_path = self.calib_dir / f"cam_{i}_{next_i}" / "log1-camchain.yaml"
-            if not chain_path.exists():
-                print(f"[Warn] Chain {i}->{next_i} missing. Poses may be wrong.")
-                poses[next_i] = np.eye(4)
+            T_next_curr = self._load_extrinsics_for_pair(i, next_i)
+
+            if T_next_curr is None:
+                print(f"  [Warn] Chain {i}->{next_i} missing. Using identity.")
+                poses[next_i] = current_pose.copy()
                 continue
 
-            with open(chain_path) as f:
-                d = yaml.safe_load(f)
-
-            # T_cn_cnm1 is T_{current}_{prev}.
-            # For pair 0-1, cam1 is current, cam0 is prev.
-            # So T_1_0 = T_cn_cnm1.
-            # Pose of 1 in 0 = T_1_0 ? No.
-            # Point in 1 = T_1_0 * Point in 0? No.
-            # Kalibr notation T_A_B usually transforms point in B to point in A.
-            # We want Pose of i, which is T_world_i (Point in i -> Point in World/Cam0).
-            # If T_1_0 transforms 0->1, then T_world_1 = T_world_0 * inv(T_1_0).
-            # Let's assume standard Extrinsics: T in yaml is 4x4.
-
-            T_next_curr = np.array(d['cam1']['T_cn_cnm1']) # T_{i+1}_{i}
-
             # Pose_{i+1} = Pose_{i} @ inv(T_{i+1}_{i})
-            # Check: P_{i+1} = T_{i+1}_{i} * P_{i}
-            # P_{world} = Pose_{i} * P_{i}
-            # P_{world} = Pose_{i+1} * P_{i+1}
-            # -> Pose_{i} * P_{i} = Pose_{i+1} * T_{i+1}_{i} * P_{i}
-            # -> Pose_{i} = Pose_{i+1} * T_{i+1}_{i}
-            # -> Pose_{i+1} = Pose_{i} * inv(T_{i+1}_{i})
-
             next_pose = current_pose @ np.linalg.inv(T_next_curr)
             poses[next_i] = next_pose
             current_pose = next_pose
 
-        # For 3->0 loop closure check? Not strictly needed for open chain.
         return poses
 
     def load_calib_data(self, i, j):
-        chain_path = self.calib_dir / f"cam_{i}_{j}" / "log1-camchain.yaml"
-        if not chain_path.exists(): return None
+        """Load intrinsics and extrinsics for a camera pair"""
 
-        with open(chain_path) as f: data = yaml.safe_load(f)
+        # Get intrinsics
+        if USE_PAIR_INTRINSICS:
+            # Load from pair calibration file
+            camL, camR = self._load_intrinsics_from_pair(i, j)
+            if camL is None or camR is None:
+                return None
+        else:
+            # Load from mono calibration
+            if i not in self.mono_intrinsics:
+                print(f"  [Error] Missing mono intrinsics for cam_{i}")
+                return None
+            if j not in self.mono_intrinsics:
+                print(f"  [Error] Missing mono intrinsics for cam_{j}")
+                return None
+            camL = self.mono_intrinsics[i]
+            camR = self.mono_intrinsics[j]
 
-        def extract_cam(d):
-            intr = d['intrinsics']
-            dist = d['distortion_coeffs']
-            return {
-                'xi': intr[0], 'fx': intr[1], 'fy': intr[2], 'cx': intr[3], 'cy': intr[4],
-                'D': np.array(dist),
-                'K': np.array([[intr[1], 0, intr[3]], [0, intr[2], intr[4]], [0,0,1]])
-            }
-
-        camL = extract_cam(data['cam0'])
-        camR = extract_cam(data['cam1'])
-        # Relative transform for rectification logic
-        T_rel = np.array(data['cam1']['T_cn_cnm1'])
+        # Get extrinsics from pair calibration or hardcoded
+        T_rel = self._load_extrinsics_for_pair(i, j)
+        if T_rel is None:
+            return None
 
         return camL, camR, T_rel
+
+    def _load_intrinsics_from_pair(self, i, j):
+        """Load intrinsics for both cameras from pair calibration file"""
+        pair_path = self.calib_dir / f"cam_{i}_{j}" / "log1-camchain.yaml"
+        if not pair_path.exists():
+            print(f"  [Error] Pair calibration not found: {pair_path}")
+            return None, None
+
+        with open(pair_path) as f:
+            data = yaml.safe_load(f)
+
+        camL = self._extract_intrinsics(data['cam0'])
+        camR = self._extract_intrinsics(data['cam1'])
+        print(f"  [Intr] Loaded intrinsics from pair calibration: cam_{i}_{j}")
+        return camL, camR
 
     def generate_virtual_maps(self, camL, camR, T_rel, i, j, rotation_deg=45.0):
         focal = self.W / (2 * np.tan(np.radians(self.HFOV / 2)))
         K_virt = np.array([[focal, 0, self.W/2], [0, focal, self.H/2], [0, 0, 1]])
 
         angle_rad = np.radians(rotation_deg)
-        R_virt_to_phys_L = _create_y_rotation_matrix(angle_rad)  # +45
-        R_virt_to_phys_R = _create_y_rotation_matrix(-angle_rad) # -45
+        R_virt_to_phys_L = _create_y_rotation_matrix(angle_rad)   # +45
+        R_virt_to_phys_R = _create_y_rotation_matrix(-angle_rad)  # -45
 
         map_L_x, map_L_y = self._make_map(camL, R_virt_to_phys_L, focal)
         map_R_x, map_R_y = self._make_map(camR, R_virt_to_phys_R, focal)
@@ -199,6 +292,7 @@ class VirtualStereoGen:
         map_y = pts2d[:, 1].reshape(self.H, self.W).astype(np.float32)
         return map_x, map_y
 
+
 # ==========================================
 # PART 2: RECTIFICATION & MERGE
 # ==========================================
@@ -231,6 +325,7 @@ def compute_rectification(virt_data):
 
     return m1l, m2l, m1r, m2r, P1, P2, Q, T_rectL_cam0
 
+
 def combine_maps(map_fisheye_to_virt, map_rect_to_virt):
     map_virt_x, map_virt_y = map_fisheye_to_virt
     map_rect_x, map_rect_y = map_rect_to_virt
@@ -238,12 +333,14 @@ def combine_maps(map_fisheye_to_virt, map_rect_to_virt):
     final_y = cv2.remap(map_virt_y, map_rect_x, map_rect_y, cv2.INTER_LINEAR)
     return final_x, final_y
 
+
 # ==========================================
 # PART 3: VISUALIZATION
 # ==========================================
 
 def visualize_comparison(imgL, imgR, mapL, mapR, pair_name):
-    if imgL is None or imgR is None: return
+    if imgL is None or imgR is None:
+        return
 
     rectL = cv2.remap(imgL, mapL[0], mapL[1], cv2.INTER_LINEAR)
     rectR = cv2.remap(imgR, mapR[0], mapR[1], cv2.INTER_LINEAR)
@@ -258,17 +355,17 @@ def visualize_comparison(imgL, imgR, mapL, mapR, pair_name):
 
     if w_before != w_after:
         scale = w_after / w_before
-        before_view = cv2.resize(before_view, (0,0), fx=scale, fy=scale)
+        before_view = cv2.resize(before_view, (0, 0), fx=scale, fy=scale)
 
     full_viz = np.vstack([before_view, after_view])
 
     # Force 2x Scale
-    full_viz = cv2.resize(full_viz, (0,0), fx=2.0, fy=2.0, interpolation=cv2.INTER_LINEAR)
+    full_viz = cv2.resize(full_viz, (0, 0), fx=2.0, fy=2.0, interpolation=cv2.INTER_LINEAR)
 
     cv2.putText(full_viz, f"BEFORE (Raw) - {pair_name}", (20, 50),
-                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0,0,255), 3)
+                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
     cv2.putText(full_viz, "AFTER (Rectified)", (20, full_viz.shape[0]//2 + 50),
-                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0,255,0), 3)
+                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
 
     win_name = f"Compare {pair_name}"
     cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
@@ -277,9 +374,11 @@ def visualize_comparison(imgL, imgR, mapL, mapR, pair_name):
     cv2.waitKey(0)
     cv2.destroyWindow(win_name)
 
+
 def grab_ros_image(bag_dir, i, j):
     p = bag_dir / f"pair_{i}_{j}"
-    if not p.exists(): return None, None
+    if not p.exists():
+        return None, None
     reader = SequentialReader()
     reader.open(StorageOptions(uri=str(p), storage_id='sqlite3'), ConverterOptions('', ''))
     topics = {f"/cam_{i}/image_raw", f"/cam_{j}/image_raw"}
@@ -288,11 +387,13 @@ def grab_ros_image(bag_dir, i, j):
         top, data, _ = reader.read_next()
         if top in topics and top not in imgs:
             msg = deserialize_message(data, Image)
-            shape = (msg.height, msg.width, 3) if msg.encoding=='bgr8' else (msg.height, msg.width)
+            shape = (msg.height, msg.width, 3) if msg.encoding == 'bgr8' else (msg.height, msg.width)
             arr = np.frombuffer(msg.data, np.uint8).reshape(shape)
-            if len(arr.shape)==2: arr = cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR)
+            if len(arr.shape) == 2:
+                arr = cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR)
             imgs[top] = arr
     return imgs.get(f"/cam_{i}/image_raw"), imgs.get(f"/cam_{j}/image_raw")
+
 
 # ==========================================
 # MAIN
@@ -305,26 +406,48 @@ def main():
     parser.add_argument("--width", type=int, default=256)
     parser.add_argument("--height", type=int, default=160)
     parser.add_argument("--hfov", type=float, default=110.0)
+    parser.add_argument("--no-viz", action="store_true", help="Skip visualization")
     args = parser.parse_args()
 
     calib_path = Path(args.calib_dir)
     out_path = Path(args.out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
+    print("\n[Init] Loading calibration data...")
+
+    if USE_PAIR_INTRINSICS:
+        print("  Intrinsics: from pair calibration (cam_X_Y/log1-camchain.yaml)")
+    else:
+        print("  Intrinsics: from mono calibration (cam_X/log1-camchain.yaml)")
+
+    if USE_HARDCODED_EXTRINSICS:
+        print("  Extrinsics: HARDCODED (averaged from calibration)")
+        print(f"    Translation: {_HARDCODED_EXTRINSIC_AVG[:3, 3]}")
+        print(f"    Pairs using hardcoded: {list(HARDCODED_EXTRINSICS.keys())}")
+    else:
+        print("  Extrinsics: from pair calibration (cam_X_Y/log1-camchain.yaml)")
+
     gen = VirtualStereoGen(calib_path, args.width, args.height, args.hfov)
-    pairs = [(0,1), (1,2), (2,3), (3,0)]
+    pairs = [(0, 1), (1, 2), (2, 3), (3, 0)]
 
     print("\n[Init] Loaded global camera poses:")
     for cid, pose in gen.cam_poses_in_cam0.items():
-        print(f"  Cam {cid}: {pose[:3,3]}")
+        print(f"  Cam {cid}: {pose[:3, 3]}")
 
     for (i, j) in pairs:
-        print(f"\nProcessing Pair {i}-{j}...")
+        print(f"\n{'='*50}")
+        print(f"Processing Pair {i}-{j}...")
+        print(f"{'='*50}")
+
         data = gen.load_calib_data(i, j)
         if not data:
-            print(f"Skipping {i}-{j}")
+            print(f"  [Skip] Missing calibration data for pair {i}-{j}")
             continue
         camL, camR, T_rel = data
+
+        print(f"  Intrinsics cam_{i}: fx={camL['fx']:.2f}, fy={camL['fy']:.2f}, xi={camL['xi']:.4f}")
+        print(f"  Intrinsics cam_{j}: fx={camR['fx']:.2f}, fy={camR['fy']:.2f}, xi={camR['xi']:.4f}")
+        print(f"  Extrinsics T_rel translation: {T_rel[:3, 3]}")
 
         virt_data = gen.generate_virtual_maps(camL, camR, T_rel, i, j, rotation_deg=45.0)
         m1l, m2l, m1r, m2r, P1, P2, Q, T_rectL_cam0 = compute_rectification(virt_data)
@@ -333,12 +456,15 @@ def main():
         final_R = combine_maps(virt_data['map_R'], (m1r, m2r))
 
         pair_str = f"{i}_{j}"
-        baseline = abs(P2[0,3] / P2[0,0])
+        baseline = abs(P2[0, 3] / P2[0, 0])
+        print(f"  Computed baseline: {baseline:.4f} m")
 
         # Save Maps (Legacy format)
         fs = cv2.FileStorage(str(out_path / f"final_rectified_to_fisheye_map_{pair_str}.yml"), cv2.FILE_STORAGE_WRITE)
-        fs.write("map_left_x", final_L[0]); fs.write("map_left_y", final_L[1])
-        fs.write("map_right_x", final_R[0]); fs.write("map_right_y", final_R[1])
+        fs.write("map_left_x", final_L[0])
+        fs.write("map_left_y", final_L[1])
+        fs.write("map_right_x", final_R[0])
+        fs.write("map_right_y", final_R[1])
         fs.release()
 
         # Save Config with CORRECT POSE
@@ -347,16 +473,23 @@ def main():
                 'pair': pair_str,
                 'final_resolution': [args.width, args.height],
                 'baseline_meters': float(baseline),
-                'K_rect_left': P1[:3,:3].tolist(),
+                'K_rect_left': P1[:3, :3].tolist(),
                 'T_rect_left_cam0': T_rectL_cam0.tolist()
             }, f)
 
-        # Visualize
-        imgL, imgR = grab_ros_image(calib_path / "ros2_bags", i, j)
-        visualize_comparison(imgL, imgR, final_L, final_R, pair_str)
+        print(f"  Saved: {out_path / f'final_rectified_to_fisheye_map_{pair_str}.yml'}")
+        print(f"  Saved: {out_path / f'final_map_config_{pair_str}.yaml'}")
 
-    print("\nProcessing Complete.")
+        # Visualize
+        if not args.no_viz:
+            imgL, imgR = grab_ros_image(calib_path / "ros2_bags", i, j)
+            visualize_comparison(imgL, imgR, final_L, final_R, pair_str)
+
+    print("\n" + "="*50)
+    print("Processing Complete.")
+    print("="*50)
     cv2.destroyAllWindows()
+
 
 if __name__ == "__main__":
     main()
