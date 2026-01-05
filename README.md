@@ -10,8 +10,8 @@ This toolkit streamlines the process into two steps:
 2. **Map Generation**
    Analytically generates virtual stereo cameras, computes rectification, merges lookup tables, and visualizes results for verification.
 
-> [!WARNING]
-> Before calibrating, verify that each lens is tightly secured in its mount. Any wobble—even a fraction of a millimeter—can cause multi-pixel shifts and invalidate your calibration.
+> [!IMPORTANT]
+> **Lens Stability is Critical:** Ensure all lenses are firmly seated in their mounts with zero play. Even slight lateral wobble (left/right movement) can translate to multiple pixels of error, severely degrading calibration accuracy and depth estimation quality.
 
 ---
 
