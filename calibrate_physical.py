@@ -21,8 +21,10 @@ import cv2
 import rclpy
 from rclpy.node import Node
 from rclpy.executors import SingleThreadedExecutor
+from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image as RosImage
 from sensor_msgs.msg import CompressedImage
+from sensor_msgs.msg import Imu as RosImu
 from builtin_interfaces.msg import Time
 
 # ROS 2 / messages for bag writing
@@ -36,6 +38,13 @@ try:
 except Exception:
     _BRIDGE = None
 
+try:
+    from px4_msgs.msg import SensorCombined as Px4SensorCombined
+    _HAVE_PX4_MSGS = True
+except Exception:
+    Px4SensorCombined = None  # placeholder so type refs at class-def time don't NameError
+    _HAVE_PX4_MSGS = False
+
 
 # ---------- CONFIG ----------
 DOCKER_IMAGE_TAG = "mortyl0834/omnitartancalib:quad_cam"
@@ -44,6 +53,9 @@ PAIR_LIST = [(0, 1), (1, 2), (2, 3), (3, 0)]
 # Default topic names
 DEFAULT_COMPRESSED_TOPIC = "/oak_ffc_4p_driver_node/compressed"
 DEFAULT_RAW_TOPIC = "/oak_ffc_4p_driver_node/image_raw"
+DEFAULT_IMU_TOPIC = "/fmu/out/sensor_combined"
+IMU_BAG_TOPIC = "/imu/data_raw"  # what gets written into the bag (sensor_msgs/Imu)
+IMU_FRAME_ID = "imu_frd"          # PX4 publishes in body-frame FRD
 # ----------------------------
 
 
@@ -177,10 +189,19 @@ class BufferedRosBagWriter:
 
     def queue_frame(self, frame_data: FrameData, writers: dict, recording_type: str, recording_data):
         try:
-            self.write_queue.put_nowait((frame_data, writers, recording_type, recording_data))
+            self.write_queue.put_nowait(("IMG", frame_data, writers, recording_type, recording_data))
             with self._lock:
                 self.queued_frames += 1
         except queue.Full:
+            self.dropped_frames += 1
+
+    def queue_imu(self, imu_msg: RosImu, t_ns: int, writers: dict, recording_type: str, recording_data):
+        """Queue an IMU sample for writing into the currently active stage bag(s)."""
+        try:
+            self.write_queue.put_nowait(("IMU", imu_msg, t_ns, writers, recording_type, recording_data))
+        except queue.Full:
+            # IMU drops are silent — at 250+ Hz the buffer fills fast if writer falls behind;
+            # we count them via dropped_frames to surface in the UI
             self.dropped_frames += 1
 
     def get_pending_count(self) -> int:
@@ -202,27 +223,39 @@ class BufferedRosBagWriter:
                     else:
                         continue
 
-                frame_data, writers, recording_type, recording_data = item
+                kind = item[0]
 
-                if recording_type == 'MONO':
-                    ci = recording_data
-                    if ci not in writers:
-                        print(f"\n[WARN] Writer for cam {ci} not found, skipping frame")
-                        continue
-                    img_msg = _ros_image_from_numpy(frame_data.frames_cv[ci], frame_data.stamp)
-                    writers[ci].writer.write(f"/cam_{ci}/image_raw", _serialize(img_msg), frame_data.timestamp_ns)
-                elif recording_type == 'PAIR':
-                    i, j = recording_data
-                    if (i, j) not in writers:
-                        print(f"\n[WARN] Writer for pair ({i}, {j}) not found, skipping frame")
-                        continue
-                    img_i = _ros_image_from_numpy(frame_data.frames_cv[i], frame_data.stamp)
-                    img_j = _ros_image_from_numpy(frame_data.frames_cv[j], frame_data.stamp)
-                    writers[(i, j)].writer.write(f"/cam_{i}/image_raw", _serialize(img_i), frame_data.timestamp_ns)
-                    writers[(i, j)].writer.write(f"/cam_{j}/image_raw", _serialize(img_j), frame_data.timestamp_ns)
+                if kind == "IMG":
+                    _, frame_data, writers, recording_type, recording_data = item
+                    if recording_type == 'MONO':
+                        ci = recording_data
+                        if ci not in writers:
+                            print(f"\n[WARN] Writer for cam {ci} not found, skipping frame")
+                            continue
+                        img_msg = _ros_image_from_numpy(frame_data.frames_cv[ci], frame_data.stamp)
+                        writers[ci].writer.write(f"/cam_{ci}/image_raw", _serialize(img_msg), frame_data.timestamp_ns)
+                    elif recording_type == 'PAIR':
+                        i, j = recording_data
+                        if (i, j) not in writers:
+                            print(f"\n[WARN] Writer for pair ({i}, {j}) not found, skipping frame")
+                            continue
+                        img_i = _ros_image_from_numpy(frame_data.frames_cv[i], frame_data.stamp)
+                        img_j = _ros_image_from_numpy(frame_data.frames_cv[j], frame_data.stamp)
+                        writers[(i, j)].writer.write(f"/cam_{i}/image_raw", _serialize(img_i), frame_data.timestamp_ns)
+                        writers[(i, j)].writer.write(f"/cam_{j}/image_raw", _serialize(img_j), frame_data.timestamp_ns)
+                    with self._lock:
+                        self.written_frames += 1
 
-                with self._lock:
-                    self.written_frames += 1
+                elif kind == "IMU":
+                    _, imu_msg, t_ns, writers, recording_type, recording_data = item
+                    if recording_type == 'MONO':
+                        ci = recording_data
+                        if ci in writers:
+                            writers[ci].writer.write(IMU_BAG_TOPIC, _serialize(imu_msg), t_ns)
+                    elif recording_type == 'PAIR':
+                        pair = recording_data
+                        if pair in writers:
+                            writers[pair].writer.write(IMU_BAG_TOPIC, _serialize(imu_msg), t_ns)
 
             except queue.Empty:
                 # If stop was requested and queue is empty, exit
@@ -268,6 +301,80 @@ class StackedImageSubscriber(Node):
     def get_new_frame(self):
         try: return self.frame_queue.get_nowait()
         except queue.Empty: return None
+
+
+class StageManager:
+    """Thread-safe holder for the currently-active recording stage so the IMU
+    callback (running on the ROS executor thread) knows which stage's bag to
+    write into. Set from the main loop, read from the IMU thread."""
+    def __init__(self):
+        self._lock = threading.Lock()
+        # (recording_type, recording_data, writers_dict) or None when idle/done/draining
+        self._active = None
+
+    def set(self, recording_type: str, recording_data, writers: dict):
+        with self._lock:
+            self._active = (recording_type, recording_data, writers)
+
+    def clear(self):
+        with self._lock:
+            self._active = None
+
+    def get(self):
+        with self._lock:
+            return self._active
+
+
+class ImuSubscriber(Node):
+    """Subscribes to a PX4 sensor_combined topic, converts each sample to a
+    sensor_msgs/Imu, and queues it into the buffered writer against whatever
+    stage is currently active (per StageManager). Idle when no stage is active."""
+    def __init__(self, topic_name: str, stage_manager: StageManager,
+                 buf_writer: 'BufferedRosBagWriter'):
+        super().__init__('imu_subscriber')
+        if not _HAVE_PX4_MSGS:
+            raise RuntimeError(
+                "px4_msgs Python bindings not found. Source a ROS 2 workspace that builds "
+                "px4_msgs (e.g. ros2_swarmnxt_ws) before running with --record-imu."
+            )
+        self._stage_mgr = stage_manager
+        self._buf = buf_writer
+        self._sample_count = 0
+        self.create_subscription(Px4SensorCombined, topic_name, self._cb, qos_profile_sensor_data)
+
+    def _cb(self, msg):
+        active = self._stage_mgr.get()
+        if active is None:
+            return
+        recording_type, recording_data, writers = active
+
+        # Use ROS reception time as the IMU timestamp. PX4's `timestamp` field is
+        # microseconds since FCU boot; aligning it to ROS time would require the
+        # /fmu/out/timesync_status offset. Reception time has small (<a few ms)
+        # variance from serial latency — Kalibr's time-offset estimate absorbs it.
+        now = self.get_clock().now().to_msg()
+        t_ns = int(now.sec) * 1_000_000_000 + int(now.nanosec)
+
+        imu_msg = RosImu()
+        imu_msg.header.stamp = now
+        imu_msg.header.frame_id = IMU_FRAME_ID
+        imu_msg.angular_velocity.x = float(msg.gyro_rad[0])
+        imu_msg.angular_velocity.y = float(msg.gyro_rad[1])
+        imu_msg.angular_velocity.z = float(msg.gyro_rad[2])
+        imu_msg.linear_acceleration.x = float(msg.accelerometer_m_s2[0])
+        imu_msg.linear_acceleration.y = float(msg.accelerometer_m_s2[1])
+        imu_msg.linear_acceleration.z = float(msg.accelerometer_m_s2[2])
+        # Mark orientation/cov fields as unknown
+        imu_msg.orientation_covariance[0] = -1.0
+        imu_msg.angular_velocity_covariance[0] = 0.0
+        imu_msg.linear_acceleration_covariance[0] = 0.0
+
+        self._buf.queue_imu(imu_msg, t_ns, writers, recording_type, recording_data)
+        self._sample_count += 1
+
+    @property
+    def sample_count(self) -> int:
+        return self._sample_count
 
 
 def _ros_image_from_numpy(img_bgr: np.ndarray, stamp) -> Image:
@@ -367,6 +474,50 @@ def _run_single_intrinsic_calib(bag_path: Path, target_yaml: Path, cam_out_dir: 
         return None
 
 
+def _run_single_imu_camera_calib(bag_path: Path, target_yaml: Path, cam_out_dir: Path,
+                                  imu_yaml: Path, cam_id: int) -> bool:
+    """Run kalibr_calibrate_imu_camera against a per-mono bag (which already has
+    /cam_{ci}/image_raw and /imu/data_raw side by side). Reuses the camchain.yaml
+    produced by the upstream intrinsics step for this same camera. Output lands
+    next to the camchain in the camera's own out dir."""
+    if not bag_path or not bag_path.exists():
+        print(f"  [WARN] IMU-cam {cam_id}: bag {bag_path} missing, skipping")
+        return False
+    camchain = cam_out_dir / "log1-camchain.yaml"
+    if not camchain.exists():
+        print(f"  [WARN] IMU-cam {cam_id}: {camchain} missing (intrinsics didn't produce a camchain)")
+        return False
+    if not imu_yaml.exists():
+        print(f"  [WARN] IMU-cam {cam_id}: {imu_yaml} missing")
+        return False
+    try:
+        # Patch a known Kalibr Boost.Python binding bug: NoMEstimator() is called
+        # with no args but its C++ ctor requires a double. The patched call passes
+        # 1.0 (a no-op scale) so the M-estimator-disabled path works. See:
+        # IccSensors.py addAccelerometerErrorTerms / addGyroscopeErrorTerms.
+        kalibr_src = ("/catkin_ws/src/kalibr/aslam_offline_calibration/kalibr/python/"
+                      "kalibr_imu_camera_calibration/IccSensors.py")
+        cmd = (f"sed -i 's|aopt.NoMEstimator()|aopt.NoMEstimator(1.0)|g' {kalibr_src} && "
+               f"cd /data/out && rosrun kalibr kalibr_calibrate_imu_camera "
+               f"--bag /data/input.bag --target /data/target.yaml "
+               f"--cam /data/out/log1-camchain.yaml --imu /data/imu.yaml "
+               f"--dont-show-report && "
+               f"cp /data/input-camchain-imucam.yaml /data/input-imu.yaml "
+               f"/data/input-results-imucam.txt /data/input-report-imucam.pdf "
+               f"/data/out/")
+        mounts = {
+            str(bag_path.absolute()):    "/data/input.bag:ro",
+            str(target_yaml.absolute()): "/data/target.yaml:ro",
+            str(imu_yaml.absolute()):    "/data/imu.yaml:ro",
+            str(cam_out_dir.absolute()): "/data/out",
+        }
+        _docker_run(cmd, mounts, gui=False)
+        return True
+    except Exception as e:
+        print(f"  [ERROR] IMU-cam {cam_id}: {e}")
+        return False
+
+
 def _run_single_extrinsic_calib(bag_path: Path, target_yaml: Path, pair_out_dir: Path, cam_i_intr: dict, cam_j_intr: dict, pair: Tuple[int, int]):
     i, j = pair
     try:
@@ -417,7 +568,8 @@ class MultiCamCalibrator:
             if p.exists():
                 with open(p, "r") as f: self.intrinsics[cam_id] = yaml.safe_load(f)["cam0"]
 
-    def collect_from_ros2_topic(self, recording_target: RecordingTarget, topic_name: str, is_compressed: bool):
+    def collect_from_ros2_topic(self, recording_target: RecordingTarget, topic_name: str, is_compressed: bool,
+                                 imu_topic: Optional[str] = None):
         if not recording_target.is_empty(): self._preserve_existing_bags(recording_target)
         if self.out.ros2_dir.exists():
             for child in self.out.ros2_dir.iterdir():
@@ -445,12 +597,27 @@ class MultiCamCalibrator:
         subscriber = StackedImageSubscriber(topic_name, is_compressed)
         executor = SingleThreadedExecutor()
         executor.add_node(subscriber)
-        threading.Thread(target=executor.spin, daemon=True).start()
 
-        mono_writers = {ci: _start_ros2_writer(self.out.ros2_dir/f"cam_{ci}_mono", [(f"/cam_{ci}/image_raw", "sensor_msgs/msg/Image")])
+        # Optional IMU subscriber — adds /imu/data_raw to every per-stage bag.
+        stage_mgr = StageManager()
+        imu_subscriber = None  # populated below if imu_topic is set
+
+        # Build per-stage topic lists. When IMU recording is on, each bag also
+        # carries an /imu/data_raw entry so Kalibr can consume the same bag.
+        imu_topic_pair = (IMU_BAG_TOPIC, "sensor_msgs/msg/Imu") if imu_topic else None
+        def _mono_topics(ci):
+            t = [(f"/cam_{ci}/image_raw", "sensor_msgs/msg/Image")]
+            if imu_topic_pair: t.append(imu_topic_pair)
+            return t
+        def _pair_topics(p):
+            t = [(f"/cam_{p[0]}/image_raw", "sensor_msgs/msg/Image"),
+                 (f"/cam_{p[1]}/image_raw", "sensor_msgs/msg/Image")]
+            if imu_topic_pair: t.append(imu_topic_pair)
+            return t
+
+        mono_writers = {ci: _start_ros2_writer(self.out.ros2_dir/f"cam_{ci}_mono", _mono_topics(ci))
                         for ci in recording_target.mono_cams}
-        pair_writers = {p: _start_ros2_writer(self.out.ros2_dir/f"pair_{p[0]}_{p[1]}",
-                        [(f"/cam_{p[0]}/image_raw", "sensor_msgs/msg/Image"), (f"/cam_{p[1]}/image_raw", "sensor_msgs/msg/Image")])
+        pair_writers = {p: _start_ros2_writer(self.out.ros2_dir/f"pair_{p[0]}_{p[1]}", _pair_topics(p))
                         for p in recording_target.pairs}
 
         # Populate path dicts immediately
@@ -459,6 +626,12 @@ class MultiCamCalibrator:
 
         buf_writer = BufferedRosBagWriter()
         buf_writer.start()
+
+        if imu_topic:
+            imu_subscriber = ImuSubscriber(imu_topic, stage_mgr, buf_writer)
+            executor.add_node(imu_subscriber)
+
+        threading.Thread(target=executor.spin, daemon=True).start()
 
         # REMOVE TOOLBAR: Use GUI_NORMAL
         cv2.namedWindow("Live Calibration Recording", cv2.WINDOW_NORMAL | cv2.WINDOW_GUI_NORMAL)
@@ -483,6 +656,7 @@ class MultiCamCalibrator:
 
                 if draining:
                     # We're draining the buffer - don't record new frames
+                    stage_mgr.clear()  # stop the IMU thread from queueing more
                     pending = buf_writer.get_pending_count()
                     if pending <= 0:
                         done = True
@@ -500,11 +674,16 @@ class MultiCamCalibrator:
                 # Normal recording logic
                 if idx == -1:
                     status = "IDLE: Press SPACE to start recording."
+                    stage_mgr.clear()
                 elif 0 <= idx < len(stages):
                     stype, sdata = stages[idx]
                     status = f"RECORDING {stype} {sdata}. SPACE to next."
                     if stype == 'MONO': recording_cams = [sdata]
                     else: recording_cams = list(sdata)
+
+                    # Tell the IMU subscriber which bag is currently active
+                    active_writers = mono_writers if stype == 'MONO' else pair_writers
+                    stage_mgr.set(stype, sdata, active_writers)
 
                     # Only write to buffer if we are in a valid recording stage (not Idle)
                     if frame_data:
@@ -518,6 +697,7 @@ class MultiCamCalibrator:
 
                 elif idx >= len(stages):
                     status = "DONE. Press 'q' to exit."
+                    stage_mgr.clear()
 
                 if frame_data:
                     last_frame_data = frame_data  # Store for draining display
@@ -545,6 +725,9 @@ class MultiCamCalibrator:
 
         finally:
             print("  [Info] Waiting for buffer to drain...")
+            # Stop the IMU thread from queueing more samples before we shut down the writer
+            stage_mgr.clear()
+
             # 1. STOP the writer thread first.
             # This waits (joins) until the queue is empty and the thread finishes.
             buf_writer.stop()
@@ -566,6 +749,10 @@ class MultiCamCalibrator:
             cv2.destroyAllWindows()
             executor.shutdown()
             subscriber.destroy_node()
+            if imu_subscriber is not None:
+                samples = imu_subscriber.sample_count
+                imu_subscriber.destroy_node()
+                print(f"  [Info] IMU samples received: {samples}")
             print("  [Info] Recording cleanup complete.")
 
     def convert_all_to_ros1(self, recording_target: RecordingTarget, force_reconvert: bool = True):
@@ -602,7 +789,8 @@ class MultiCamCalibrator:
             if (force_reconvert and pr in recording_target.pairs) or not dst.exists():
                 convert(src, dst)
 
-    def run_calibration(self, target: CalibrationTarget, workers: int):
+    def run_calibration(self, target: CalibrationTarget, workers: int,
+                        imu_yaml: Optional[Path] = None):
         # Intrinsics
         with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as ex:
             futs = {}
@@ -625,6 +813,20 @@ class MultiCamCalibrator:
                                             self.out.out_dir/f"cam_{i}_{j}", self.intrinsics[i], self.intrinsics[j], (i, j)))
             for f in concurrent.futures.as_completed(futs): f.result()
 
+        # IMU-camera (one Kalibr run per mono bag — gives 4 independent T_cam_imu
+        # estimates that should agree once composed with the cam-cam extrinsics).
+        if imu_yaml is not None:
+            print("\n[Step 4] Running per-camera IMU-camera calibration...")
+            with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as ex:
+                futs = []
+                for ci in target.mono_cams:
+                    bag = self.out.mono_bags_ros1.get(ci)
+                    if bag and bag.exists() and ci in self.intrinsics:
+                        futs.append(ex.submit(_run_single_imu_camera_calib, bag,
+                                              self.target_yaml, self.out.out_dir/f"cam_{ci}",
+                                              imu_yaml, ci))
+                for f in concurrent.futures.as_completed(futs): f.result()
+
 
 def main():
     import argparse
@@ -635,6 +837,14 @@ def main():
     ap.add_argument("--uncompressed", action="store_true")
     ap.add_argument("--topic", type=str, default=None)
     ap.add_argument("--workers", type=int, default=os.cpu_count())
+    ap.add_argument("--record-imu", action="store_true",
+                    help="Subscribe to a PX4 sensor_combined topic and write /imu/data_raw "
+                         "into every per-stage bag, then run kalibr_calibrate_imu_camera per mono.")
+    ap.add_argument("--imu-topic", type=str, default=DEFAULT_IMU_TOPIC,
+                    help=f"PX4 IMU topic to record (default: {DEFAULT_IMU_TOPIC}). "
+                         f"Requires px4_msgs to be importable.")
+    ap.add_argument("--imu-yaml", type=str, default="imu.yaml",
+                    help="Kalibr IMU YAML (Allan variance + topic + rate). Default: ./imu.yaml")
     args = ap.parse_args()
 
     rec_target = RecordingTarget.parse(args.only)
@@ -646,19 +856,30 @@ def main():
     if not target_yaml.exists():
         with open(target_yaml, 'w') as f: f.write("target_type: 'aprilgrid'\ntagCols: 6\ntagRows: 6\ntagSize: 0.088\ntagSpacing: 0.3\n")
 
+    imu_yaml_path: Optional[Path] = None
+    if args.record_imu:
+        imu_yaml_path = Path(args.imu_yaml).resolve()
+        if not imu_yaml_path.exists():
+            print(f"[ERROR] --record-imu requires {imu_yaml_path} (Kalibr IMU YAML). "
+                  f"Seed it from quarterKalibr or your own Allan variance run.")
+            sys.exit(2)
+
     calib = MultiCamCalibrator(out_dir, target_yaml)
     topic = args.topic if args.topic else (DEFAULT_RAW_TOPIC if args.uncompressed else DEFAULT_COMPRESSED_TOPIC)
 
     did_record = False
     if not args.skip_recording:
-        calib.collect_from_ros2_topic(rec_target, topic, not args.uncompressed)
+        calib.collect_from_ros2_topic(
+            rec_target, topic, not args.uncompressed,
+            imu_topic=args.imu_topic if args.record_imu else None,
+        )
         did_record = True
 
     calib.discover_ros2_bags()
     calib.convert_all_to_ros1(rec_target, force_reconvert=did_record)
 
     calib.load_existing_intrinsics(cal_target)
-    calib.run_calibration(cal_target, args.workers)
+    calib.run_calibration(cal_target, args.workers, imu_yaml=imu_yaml_path)
 
 if __name__ == "__main__":
     main()

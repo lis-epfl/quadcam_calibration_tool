@@ -1,0 +1,25 @@
+# Kalibr IMU YAML. Seeded from UAV-Swarm/tools-quarterKalibr's `imu.yaml`
+# (https://github.com/UAV-Swarm/tools-quarterKalibr/blob/master/imu.yaml).
+# Same chip family. Replace these with values from your own Allan variance
+# recording (`allan_variance_ros`) once you've run one — that's what these
+# values represent: continuous-time noise densities + bias random walk.
+#
+# rostopic must match what the ROS 1 bag contains after rosbags-convert; we
+# publish into the bag at IMU_BAG_TOPIC = /imu/data_raw.
+# update_rate should match the *actual* publish rate of /fmu/out/sensor_combined.
+# Note: PX4's uxrce_dds bridge converts dds_topics.yaml's rate_limit field to a
+# poll interval in integer milliseconds (truncated), so achievable rates are
+# 1000/N Hz: 1000, 500, 333, 250, 200, 167, 143, 125, 111, 100, ...
+# rate_limit: 300. → 1e3/300 = 3.33 ms → truncated to 3 ms → 333 Hz actual.
+# Set update_rate here to whatever `ros2 topic hz /fmu/out/sensor_combined` shows.
+
+#Accelerometer
+accelerometer_noise_density: 0.0018445838609014217
+accelerometer_random_walk: 9.637244490647607e-05
+
+#Gyroscope
+gyroscope_noise_density: 0.0001606421844332533
+gyroscope_random_walk: 6.091456992295194e-06
+
+rostopic: '/imu/data_raw'
+update_rate: 333.0
